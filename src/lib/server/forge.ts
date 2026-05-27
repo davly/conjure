@@ -17,6 +17,19 @@
 
 import { findAdvisory } from '$lib/cohort/honest/advisories';
 import { loudOnce } from '$lib/cohort/honest/loudonce';
+import { LimitlessBrowserBridge } from '$lib/integrations/limitless_browser';
+import type {
+  ContentModerationVerdict,
+  ILimitlessBrowserBridge,
+  NativeStorageHandle,
+} from '$lib/integrations/limitless_browser';
+import { PistachioKnowledgeClient } from '$lib/integrations/pistachio';
+import type {
+  DifficultyCurve,
+  IPistachioKnowledgeClient,
+  KnowledgeBedrockResponse,
+  MechanicPattern,
+} from '$lib/integrations/pistachio';
 import type {
   AssessResult,
   EscapeResult,
@@ -281,3 +294,245 @@ export async function generate(opts: {
 
 /** Pin to the cohort forge version for receipt provenance. */
 export const FORGE_VERSION: string = CONJURE_FORGE_VERSION;
+
+// ---------------------------------------------------------------------------
+// Integration-enriched forge pipeline (R145.B sibling-not-stacked variant).
+//
+// This is the Phase-1.5 integration-aware forge.generate(). It is opt-in via
+// `opts.integrations` so the existing `generate()` Phase-1 behaviour is
+// PRESERVED unchanged. Adding integration callers does NOT require touching
+// the original pipeline.
+//
+// R145.B compliance: this is a sibling function on the same parent module,
+// NOT a stacked overload of `generate()`. Callers explicitly opt in by using
+// `generateWithIntegrations()` + passing integration clients.
+//
+// Wiring summary:
+//   IDENTIFY  -> consult PistachioKnowledgeClient.queryClosestMechanics(prompt)
+//                to enrich the closestExistingGames rationale with Pistachio
+//                Knowledge Bedrock entries.
+//   ASSESS    -> consult PistachioKnowledgeClient.getRetentionPattern(kind)
+//                to source the quality scoring threshold from Pistachio's
+//                playtest corpus.
+//   PERSIST   -> consult LimitlessBrowserBridge.getNativeStorage(scope) and
+//                prefer the native handle when running inside
+//                limitless-browser; fall back to IndexedDB otherwise.
+//   EXPLAIN   -> append Pistachio Knowledge Bedrock citation + difficulty
+//                curve citation to the rationale when integrations returned
+//                non-empty data.
+//
+// All integration clients default to the mock implementations so Phase-1
+// tests continue to pass without any environment configuration.
+// ---------------------------------------------------------------------------
+
+/** Per-integration provenance trail surfaced on the result. */
+export interface IntegrationsTrail {
+  readonly pistachioCorpusVersion: string;
+  readonly pistachioCitations: ReadonlyArray<string>;
+  readonly bridgeNativeStorageBackend: string;
+  readonly bridgeIsLimitlessBrowser: boolean;
+  readonly contentModerationVerdict: string;
+  readonly contentModerationReviewedByCounsel: boolean;
+}
+
+/** Integration-enriched GenerationResult superset (additive over base). */
+export interface GenerationResultEnriched extends GenerationResult {
+  readonly integrations: IntegrationsTrail;
+}
+
+/** Optional integration overrides for generateWithIntegrations(). */
+export interface IntegrationsOptions {
+  readonly pistachio?: IPistachioKnowledgeClient;
+  readonly bridge?: ILimitlessBrowserBridge;
+  /**
+   * Optional storage scope key for the native-storage handle. Defaults
+   * to the cohort-canonical "conjure.games" scope.
+   */
+  readonly storageScope?: string;
+  /**
+   * When true, submit a content-moderation request to the bridge as
+   * part of the pipeline. Defaults to true (Phase 1.5: mock returns
+   * requires-human-review).
+   */
+  readonly enableContentModeration?: boolean;
+}
+
+/**
+ * Build the integration trail provenance record. Composable + pure --
+ * just shapes the inputs into the readonly trail record.
+ */
+function buildIntegrationsTrail(args: {
+  readonly pistachioResp: KnowledgeBedrockResponse;
+  readonly retention: MechanicPattern;
+  readonly curve: DifficultyCurve;
+  readonly storage: NativeStorageHandle;
+  readonly bridge: ILimitlessBrowserBridge;
+  readonly moderation: ContentModerationVerdict | null;
+}): IntegrationsTrail {
+  const citations: string[] = [];
+  if (args.pistachioResp.citation) citations.push(args.pistachioResp.citation);
+  if (args.retention.citation) citations.push(args.retention.citation);
+  if (args.curve.citation) citations.push(args.curve.citation);
+  return Object.freeze({
+    pistachioCorpusVersion: args.pistachioResp.corpusVersion,
+    pistachioCitations: Object.freeze(citations),
+    bridgeNativeStorageBackend: args.storage.backend,
+    bridgeIsLimitlessBrowser: args.bridge.isRunningInLimitlessBrowser(),
+    contentModerationVerdict: args.moderation
+      ? args.moderation.verdict
+      : 'not-checked',
+    contentModerationReviewedByCounsel: args.moderation
+      ? args.moderation.reviewedByCounsel
+      : false,
+  });
+}
+
+/**
+ * Phase 1.5 integration-enriched forge entry point. Defaults to the mock
+ * Pistachio + mock LimitlessBrowserBridge so this is safe to call from
+ * Phase-1 tests.
+ *
+ * R143 honest-defaults still fire (content-moderation + IP-infringement
+ * advisories) -- the bridge's content-moderation verdict is a SUPPLEMENTAL
+ * source of moderation truth, NOT a replacement for the R143 advisory
+ * surface (which warns that moderation is NOT enforced in Phase 1).
+ *
+ * R166 LIBRARY-RECOMMENDS-HOST-ACTS: the returned IntegrationsTrail
+ * exposes the `contentModerationReviewedByCounsel` boolean so callers
+ * can branch on counsel-review status before silencing the R143
+ * `CONJURE_REVENUE_SHARE_60_40_NOT_LEGALLY_REVIEWED` advisory.
+ */
+export async function generateWithIntegrations(opts: {
+  readonly prompt: string;
+  readonly creatorId: string;
+  readonly integrations?: IntegrationsOptions;
+}): Promise<GenerationResultEnriched> {
+  // Resolve integration clients (default to mocks for safety).
+  const pistachioClient: IPistachioKnowledgeClient =
+    opts.integrations?.pistachio ?? new PistachioKnowledgeClient({ env: {} });
+  const bridge: ILimitlessBrowserBridge =
+    opts.integrations?.bridge ?? new LimitlessBrowserBridge({ forceMock: true });
+  const storageScope = opts.integrations?.storageScope ?? 'conjure.games';
+  const enableModeration = opts.integrations?.enableContentModeration ?? true;
+
+  // Fire R143 honesty advisories (preserved from base generate()).
+  const ipAdv = findAdvisory('CONJURE_IP_INFRINGEMENT_DETECTION_PLACEHOLDER');
+  const modAdv = findAdvisory('CONJURE_CONTENT_MODERATION_AI_ASSISTED_NOT_ENFORCED');
+  if (ipAdv) loudOnce(ipAdv);
+  if (modAdv) loudOnce(modAdv);
+
+  // Phase 1 stubs (Nexus + Pistachio runtime stub).
+  await nexus.interpret({ prompt: opts.prompt });
+
+  // IDENTIFY -- consult Pistachio Knowledge Bedrock for closest mechanics.
+  const baseId = identify(opts.prompt);
+  const pistachioResp = await pistachioClient.queryClosestMechanics(opts.prompt);
+  const enrichedClosest: string[] = [...baseId.closestExistingGames];
+  for (const entry of pistachioResp.entries) {
+    const title = (entry.body as { readonly title?: unknown }).title;
+    if (typeof title === 'string' && !enrichedClosest.includes(title)) {
+      enrichedClosest.push(title);
+    }
+  }
+  const id: IdentifyResult = Object.freeze({
+    mechanicKind: baseId.mechanicKind,
+    confidence: baseId.confidence,
+    closestExistingGames: Object.freeze(enrichedClosest),
+  });
+
+  // ASSESS -- consult retention pattern for quality scoring threshold.
+  const retention = await pistachioClient.getRetentionPattern(id.mechanicKind);
+  const retentionBp = Math.round(retention.retentionScore * 10000);
+  // Retention-pattern-informed quality score: blend the Phase-1 placeholder
+  // (7500 bp = 75%) with the Pistachio playtest retention score weighted
+  // 50/50. Phase 2 will replace this with a calibrated assessor.
+  const blendedScore = Math.round((7500 + retentionBp) / 2);
+  const asResult: AssessResult = Object.freeze({
+    playable: true,
+    completable: true,
+    engagementScoreBasisPoints: blendedScore,
+  });
+
+  // ESCAPE (unchanged).
+  const esc = escape(id, asResult);
+
+  // OBSERVE / FORGET (unchanged).
+  const obs = observe();
+  const fg = forget();
+
+  // PERSIST -- prefer native-storage handle when bridge is available.
+  const storage = await bridge.getNativeStorage(storageScope);
+  const ps: PersistResult = Object.freeze({
+    placeholder: true,
+    note:
+      storage.backend === 'unavailable'
+        ? 'PERSIST stage Phase-1.5: bridge unavailable, falling back to IndexedDB plan (Phase-2 wire-in). storage.backend=unavailable'
+        : `PERSIST stage Phase-1.5: native-storage handle acquired via limitless-browser bridge. storage.backend=${storage.backend}; handle=${storage.handleId}`,
+  });
+
+  // EXPLAIN -- enrich rationale with Pistachio difficulty-curve citation.
+  const baseEx = explain(id, esc, opts.prompt);
+  const curve = await pistachioClient.getDifficultyCurve(
+    retention.targetCompletionPercent,
+  );
+  const enrichedExplanation =
+    `${baseEx.explanation} ` +
+    `Closest existing games (Pistachio-enriched): ${enrichedClosest.join(', ')}. ` +
+    `Retention pattern: ${retention.canonicalName} (${retention.citation}). ` +
+    `Difficulty curve: target ${curve.targetCompletionPercent}% completion ` +
+    `(${curve.citation}).`;
+  const ex: ExplainResult = Object.freeze({
+    title: baseEx.title,
+    difficulty: baseEx.difficulty,
+    explanation: enrichedExplanation,
+  });
+
+  // Build the GameSpec (unchanged shape).
+  const generatedAtUnixMs = Date.now();
+  const gameId = `game_${generatedAtUnixMs}_${id.mechanicKind}`;
+  const spec: GameSpec = Object.freeze({
+    gameId,
+    title: ex.title,
+    mechanicKind: id.mechanicKind,
+    visualStyle: chooseVisualStyle(opts.prompt),
+    audioMood: 'chill',
+    difficulty: ex.difficulty,
+    description: `Conjured: ${opts.prompt}`,
+    generatedAtUnixMs,
+  });
+
+  // Exercise the Phase-1 Pistachio runtime stub for parity (return ignored).
+  await pistachio.generate({ spec });
+
+  // Optional content-moderation step via the bridge.
+  let moderation: ContentModerationVerdict | null = null;
+  if (enableModeration) {
+    moderation = await bridge.getContentModerationVerdict({
+      gameId: spec.gameId,
+      title: spec.title,
+      description: spec.description,
+      creatorId: opts.creatorId,
+    });
+  }
+
+  const integrations = buildIntegrationsTrail({
+    pistachioResp,
+    retention,
+    curve,
+    storage,
+    bridge,
+    moderation,
+  });
+
+  return Object.freeze({
+    spec,
+    identify: id,
+    assess: asResult,
+    escape: esc,
+    observe: obs,
+    forget: fg,
+    persist: ps,
+    explain: ex,
+    integrations,
+  });
+}
