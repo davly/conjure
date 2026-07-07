@@ -158,3 +158,95 @@ Every cohort commit cites its commit SHA + test receipt (Vitest pass count or
 "deferred-to-CI" with the CI run URL). The impl log at
 `reviews/IMPLEMENTATION_2026-05-27-LATE-NIGHT/NEW_FLAGSHIP_CONJURE.md` is the
 canonical Verdict surface.
+
+## 10. Integration architecture (Phase 1.5 scaffold; Phase 2+ live)
+
+Conjure integrates with two sibling Limitless flagships: **Pistachio** (the
+C++20 Vulkan 1.3 engine flagship) and **limitless-browser** (the Tauri 2 Rust
+desktop browser flagship). Phase 1.5 ships the CONTRACT scaffold + mock
+implementations + forge wire-in on a new sibling-not-stacked `src/lib/
+integrations/` package tree. Phase 2 wires the live bindings.
+
+The architecture, contracts, sequence diagrams, and feature-flag matrices live
+in `docs/INTEGRATION_PISTACHIO.md` + `docs/INTEGRATION_LIMITLESS_BROWSER.md`.
+
+### Pistachio integration (knowledge feed)
+
+- **Source surface.** Pistachio's `engine/foundation/knowledge/` Knowledge
+  Bedrock (8 domains, ~873 entries) + `engine/ai/LoreDatabase.{h,cpp}` Lore
+  graph (LoreCharacter / LorePrinciple archetypes).
+- **Conjure-side package.** `src/lib/integrations/pistachio/` — types +
+  endpoints + mock + client + tests.
+- **Wire contract** (4 GET endpoints under `/forge/`):
+  - `GET /forge/knowledge/closest_mechanics?prompt=<text>`
+  - `GET /forge/knowledge/retention_pattern?mechanicKind=<kind>`
+  - `GET /forge/knowledge/difficulty_curve?targetCompletionPercent=<int>`
+  - `GET /forge/lore/context?theme=<text>`
+- **Forge wire-in.** IDENTIFY consults `queryClosestMechanics()`; ASSESS uses
+  `getRetentionPattern()` to blend the quality score; EXPLAIN cites Pistachio
+  Knowledge Bedrock entries; PERSIST uses native storage when bridge available.
+- **Feature flags.** `CONJURE_PISTACHIO_LIVE=true` + `CONJURE_PISTACHIO_
+  KNOWLEDGE_URL=<host>` opt-in to the live binding (Phase 2). Defaults to mock
+  for Phase 1.5 — all existing tests pass with zero env-var configuration.
+
+### limitless-browser integration (Tauri 2 desktop shell)
+
+- **Source surface.** limitless-browser's Tauri 2 multi-webview shell +
+  tauri-plugin-store (Phase 2) + phantom-content-moderation /
+  phantom-membrane-service / phantom-mint crates (Phase 2+).
+- **Conjure-side package.** `src/lib/integrations/limitless_browser/` —
+  types + detect + mock + bridge + tests.
+- **Tauri command contract** (4 canonical `#[tauri::command]` handlers):
+  - `conjure_detect_capability`
+  - `conjure_get_native_storage`
+  - `conjure_request_multi_webview_game_launch`
+  - `conjure_get_content_moderation_verdict`
+- **Forge wire-in.** PERSIST prefers `bridge.getNativeStorage(scope)` when
+  running inside limitless-browser; falls back to IndexedDB otherwise.
+  Optional content-moderation step via `bridge.getContentModerationVerdict()`.
+- **Detection.** `isRunningInLimitlessBrowser()` returns true only when BOTH
+  Tauri 2 globals AND the `__LIMITLESS_BROWSER_VERSION__` marker are present
+  (defence in depth: marker without Tauri runtime is malformed).
+
+### Phase milestones
+
+- **Phase 1.5** (2026-05-27, this ship) — contract scaffold + mocks + forge
+  wire-in (opt-in via `generateWithIntegrations()`) + 73 new tests.
+- **Phase 2** (deferred) — live HTTP wrapper around Pistachio Knowledge
+  Bedrock (~3-5 founder-days on the Pistachio side) + 4 canonical Tauri
+  commands on limitless-browser (~1-2 founder-weeks).
+- **Phase 3** (further out) — native runtime fork (Conjure desktop runs
+  inside Pistachio's Vulkan 1.3 RenderGraph) + Phase 4 economy integration
+  (phantom-mint paid-game receipts + native ad SDK).
+
+### R145.B sibling-not-stacked discipline
+
+The integrations are additive sibling packages under a NEW directory
+(`src/lib/integrations/`); zero edits to existing cohort packages under
+`src/lib/cohort/`. The forge wire-in adds a NEW exported function
+`generateWithIntegrations()` on the same parent module (forge.ts); the
+existing `generate()` is preserved byte-identical so existing 121 tests
+calling `generate()` continue to pass without any modification.
+
+The integration-enriched pipeline is opt-in by name (callers must use
+`generateWithIntegrations()`) AND opt-in by env flag for live binding
+(`CONJURE_PISTACHIO_LIVE=true` for Pistachio; runtime detection of
+`__LIMITLESS_BROWSER_VERSION__` for the bridge). Phase-1 mock-only tests
+keep passing.
+
+### R166 LIBRARY-RECOMMENDS-HOST-ACTS extension
+
+Both integrations preserve the R166 boundary discipline:
+
+- **Pistachio mock**: `MOCK_REVIEWED_BY_COUNSEL = false`. Phase 2 live
+  responses default the same way — host responsible for counsel review of
+  any Bedrock entry used on revenue/IP/liability surfaces.
+- **limitless-browser bridge content-moderation**: `reviewedByCounsel:
+  false` on every verdict (mock AND live). The bridge does NOT silently
+  flip the sentinel even when phantom-content-moderation returns
+  `verdict=pass`; the host is still responsible for the underlying
+  moderation policy + counsel review of the rule set.
+
+The `IntegrationsTrail.contentModerationReviewedByCounsel` field surfaces
+this so the studio admin surfaces can gate on counsel-review status before
+silencing the `CONJURE_REVENUE_SHARE_60_40_NOT_LEGALLY_REVIEWED` advisory.
